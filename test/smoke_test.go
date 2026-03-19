@@ -93,6 +93,14 @@ func TestSmoke(t *testing.T) {
 		t.Fatalf("manifest.Push: %v", err)
 	}
 
+	// Verify manifest round-trip before proceeding.
+	t.Log("Verifying manifest pull...")
+	pulled, err := manifestSvc.Pull(ctx)
+	if err != nil {
+		t.Fatalf("manifest.Pull after push: %v", err)
+	}
+	t.Logf("Manifest pulled OK, files=%d", len(pulled.Files))
+
 	// --- Put ---
 	content := []byte("ghfs smoke test content - " + time.Now().Format(time.RFC3339))
 	localFile := filepath.Join(tmpDir, "smoke-input.txt")

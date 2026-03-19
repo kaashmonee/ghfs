@@ -12,14 +12,15 @@ import (
 
 func TestPutFile_Create(t *testing.T) {
 	fileContent := []byte("hello ghfs")
-	expectedB64 := base64.StdEncoding.EncodeToString(fileContent)
+	// PutFile double base64-encodes: inner = base64(raw), outer = base64(inner) for API content field
+	innerB64 := base64.StdEncoding.EncodeToString(fileContent)
+	expectedB64 := base64.StdEncoding.EncodeToString([]byte(innerB64))
 
 	var gotMethod, gotPath string
 	var gotBody putFileRequest
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
-			// File does not exist yet.
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -62,13 +63,17 @@ func TestPutFile_Create(t *testing.T) {
 
 func TestGetFile(t *testing.T) {
 	original := []byte("file content here")
-	encoded := base64.StdEncoding.EncodeToString(original)
+	// Simulate what GitHub stores: PutFile sends double-encoded content.
+	// GitHub base64-decodes the API content field, storing the inner base64 string.
+	// On GET, GitHub base64-encodes that stored string, giving us the outer layer.
+	innerB64 := base64.StdEncoding.EncodeToString(original)
+	storedAsB64 := base64.StdEncoding.EncodeToString([]byte(innerB64))
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(contentsResponse{
 			SHA:     "sha1",
-			Content: encoded,
+			Content: storedAsB64,
 		})
 	}))
 	defer ts.Close()
@@ -85,11 +90,11 @@ func TestGetFile(t *testing.T) {
 
 func TestGetFile_LargeFile(t *testing.T) {
 	original := []byte("large file content")
-	encoded := base64.StdEncoding.EncodeToString(original)
+	innerB64 := base64.StdEncoding.EncodeToString(original)
+	storedAsB64 := base64.StdEncoding.EncodeToString([]byte(innerB64))
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/repos/owner/repo/contents/big.bin" {
-			// Contents API returns empty content with git_url for large files.
 			w.WriteHeader(http.StatusOK)
 			json.NewEncoder(w).Encode(contentsResponse{
 				SHA:    "sha1",
@@ -97,9 +102,9 @@ func TestGetFile_LargeFile(t *testing.T) {
 			})
 			return
 		}
-		// Blobs API.
+		// Blobs API returns the stored content base64-encoded.
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(blobResponse{Content: encoded})
+		json.NewEncoder(w).Encode(blobResponse{Content: storedAsB64})
 	}))
 	defer ts.Close()
 

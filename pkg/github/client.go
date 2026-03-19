@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -145,9 +146,13 @@ func (c *Client) doRequest(ctx context.Context, method, url string, body io.Read
 func (c *Client) PutFile(ctx context.Context, repo, path string, content []byte) (string, error) {
 	url := fmt.Sprintf("%s/repos/%s/%s/contents/%s", c.baseURL, c.owner, repo, path)
 
+	// Double base64-encode: first encode our binary data to ASCII-safe base64,
+	// then encode that for the GitHub API's content field. This prevents Git's
+	// line-ending normalization from corrupting binary data (e.g., \r\n → \n).
+	safeContent := base64.StdEncoding.EncodeToString(content)
 	reqBody := putFileRequest{
 		Message: "ghfs: update",
-		Content: base64.StdEncoding.EncodeToString(content),
+		Content: base64.StdEncoding.EncodeToString([]byte(safeContent)),
 	}
 
 	// Try to get existing file SHA for updates.
@@ -170,12 +175,12 @@ func (c *Client) PutFile(ctx context.Context, repo, path string, content []byte)
 		return "", fmt.Errorf("github: marshaling put request: %w", marshalErr)
 	}
 
-	respBody, status, err := c.doRequest(ctx, http.MethodPut, url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return "", err
+	respBody, putStatus, putErr := c.doRequest(ctx, http.MethodPut, url, bytes.NewReader(bodyBytes))
+	if putErr != nil {
+		return "", putErr
 	}
-	if status != http.StatusOK && status != http.StatusCreated {
-		return "", fmt.Errorf("github: PutFile unexpected status %d: %s", status, string(respBody))
+	if putStatus != http.StatusOK && putStatus != http.StatusCreated {
+		return "", fmt.Errorf("github: PutFile unexpected status %d: %s", putStatus, string(respBody))
 	}
 
 	var putResp putFileResponse
@@ -205,10 +210,19 @@ func (c *Client) GetFile(ctx context.Context, repo, path string) ([]byte, error)
 	}
 
 	// If content is present, decode and return.
+	// GitHub wraps base64 with newlines, so strip them before decoding.
+	// We double base64-encode on PUT (to avoid Git line-ending normalization),
+	// so we need to double-decode here: first decode GitHub's base64 layer to
+	// get our ASCII-safe base64 string, then decode that to get the raw bytes.
 	if cr.Content != "" {
-		decoded, err := base64.StdEncoding.DecodeString(cr.Content)
+		cleaned := strings.ReplaceAll(cr.Content, "\n", "")
+		outerDecoded, err := base64.StdEncoding.DecodeString(cleaned)
 		if err != nil {
-			return nil, fmt.Errorf("github: decoding base64 content: %w", err)
+			return nil, fmt.Errorf("github: decoding outer base64: %w", err)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(string(outerDecoded))
+		if err != nil {
+			return nil, fmt.Errorf("github: decoding inner base64: %w", err)
 		}
 		return decoded, nil
 	}
@@ -231,16 +245,38 @@ func (c *Client) GetFile(ctx context.Context, repo, path string) ([]byte, error)
 		return nil, fmt.Errorf("github: unmarshaling blob response: %w", err)
 	}
 
-	decoded, err := base64.StdEncoding.DecodeString(br.Content)
+	cleanedBlob := strings.ReplaceAll(br.Content, "\n", "")
+	outerDecoded, err := base64.StdEncoding.DecodeString(cleanedBlob)
 	if err != nil {
-		return nil, fmt.Errorf("github: decoding blob base64 content: %w", err)
+		return nil, fmt.Errorf("github: decoding blob outer base64: %w", err)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(string(outerDecoded))
+	if err != nil {
+		return nil, fmt.Errorf("github: decoding blob inner base64: %w", err)
 	}
 	return decoded, nil
 }
 
 // DeleteFile removes a file from the repository via the Contents API.
+// If sha is empty, it fetches the current SHA first.
 func (c *Client) DeleteFile(ctx context.Context, repo, path, sha string) error {
 	url := fmt.Sprintf("%s/repos/%s/%s/contents/%s", c.baseURL, c.owner, repo, path)
+
+	// If SHA not provided, fetch it.
+	if sha == "" {
+		getBody, status, err := c.doRequest(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return fmt.Errorf("github: fetching SHA for delete: %w", err)
+		}
+		if status != http.StatusOK {
+			return fmt.Errorf("github: fetching SHA for delete unexpected status %d: %s", status, string(getBody))
+		}
+		var cr contentsResponse
+		if err := json.Unmarshal(getBody, &cr); err != nil {
+			return fmt.Errorf("github: unmarshaling SHA response: %w", err)
+		}
+		sha = cr.SHA
+	}
 
 	reqBody := deleteFileRequest{
 		Message: "ghfs: delete",
